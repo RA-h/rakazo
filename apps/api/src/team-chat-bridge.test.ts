@@ -109,8 +109,7 @@ describe("team chat bridge", () => {
     expect(updateMany).toHaveBeenLastCalledWith({
       where: {
         id: "external-deferred",
-        status: { in: ["deferred", "received", "observed", "queueing"] },
-        runId: null,
+        status: { in: ["deferred", "received", "observed"] },
         externalConversation: { provider: "slack", botId: "bot-1" },
       },
       data: {
@@ -338,8 +337,7 @@ describe("team chat bridge", () => {
     expect(updateMany).toHaveBeenCalledWith({
       where: {
         id: "external-raced",
-        status: { in: ["deferred", "received", "observed", "queueing"] },
-        runId: null,
+        status: { in: ["deferred", "received", "observed"] },
         externalConversation: { provider: "slack", botId: "bot-1" },
       },
       data: {
@@ -381,6 +379,34 @@ describe("team chat bridge", () => {
       .nextAttemptAt;
     expect(nextAttemptAt.getTime()).toBeGreaterThanOrEqual(before + 25 * 60_000);
     expect(nextAttemptAt.getTime()).toBeLessThanOrEqual(after + 30 * 60_000);
+  });
+
+  it("heartbeats the deferred routing lease until stopped", async () => {
+    vi.useFakeTimers();
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+    const bridge = new TeamChatBridge({
+      prisma: { externalMessage: { updateMany } } as unknown as PrismaClient,
+      events: { sendUserMessage: vi.fn() },
+      jobs: { enqueue: vi.fn() },
+      send: vi.fn(),
+      providerId: "slack",
+      botId: "bot-1",
+    });
+    (
+      bridge as unknown as {
+        target: { id: string; spaceId: string; userId: string; name: string };
+      }
+    ).target = { id: "bot-1", spaceId: "space-1", userId: "owner-1", name: "Chief" };
+
+    const stop = bridge.startDeferredReservationHeartbeat("external-deferred", 1_000);
+    expect(updateMany).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(updateMany.mock.calls.length).toBeGreaterThanOrEqual(4);
+    stop();
+    const callsAfterStop = updateMany.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(updateMany).toHaveBeenCalledTimes(callsAfterStop);
+    vi.useRealTimers();
   });
 
   it("does not queue a received message that already woke a message routine", async () => {

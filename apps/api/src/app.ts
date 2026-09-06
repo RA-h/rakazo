@@ -551,10 +551,12 @@ export async function createApp(
           // the message, so the timer cannot start a second TeamChat run.
           const target = await teamChatBridge.receive(mapped, { queueAgent: false });
           if (!target.deferred) return;
-          // Hold the deferred row for the full routing window (not the short
-          // initial lease) so reconcile cannot promote mid-wake.
-          await teamChatBridge.extendDeferredReservation(target.externalMessageId);
-          let woken: boolean;
+          // Keep refreshing the deferred lease for the whole wake so a slow
+          // routine delivery cannot expire into a fallback TeamChat agent run.
+          const stopLeaseHeartbeat = teamChatBridge.startDeferredReservationHeartbeat(
+            target.externalMessageId,
+          );
+          let woken = false;
           try {
             woken = await wakeMessageRoutines(inboundDeps, target, event, {
               // Must match TeamChatBridge ExternalConversation / recovery provider.
@@ -568,6 +570,8 @@ export async function createApp(
             );
             await teamChatBridge.reconcileOnce();
             throw error;
+          } finally {
+            stopLeaseHeartbeat();
           }
           await teamChatBridge.resolveDeferredMessage(
             target.externalMessageId,

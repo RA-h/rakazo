@@ -271,10 +271,29 @@ export class TeamChatBridge {
   }
 
   /**
+   * Refresh the deferred routing lease for the whole wake. Call the returned
+   * stopper when wakeMessageRoutines settles (success or failure).
+   */
+  startDeferredReservationHeartbeat(
+    externalMessageId: string,
+    intervalMs = 60_000,
+  ): () => void {
+    void this.extendDeferredReservation(externalMessageId);
+    const timer = setInterval(() => {
+      void this.extendDeferredReservation(externalMessageId).catch((error) => {
+        getLogger().error("team chat deferred lease heartbeat failed", error);
+      });
+    }, intervalMs);
+    timer.unref?.();
+    return () => clearInterval(timer);
+  }
+
+  /**
    * Resolve a deferred message before the reconciler is allowed to claim it.
-   * Routine ownership may also reclaim `received` / `observed` / `queueing`
-   * rows (with no linked run) when the deferred lease expired mid-wake before
-   * this resolve ran.
+   * Routine ownership may also reclaim `received` / `observed` rows when the
+   * deferred lease expired mid-wake before this resolve ran. Do not reclaim
+   * `queueing`: that status means fallback delivery may already be creating a
+   * TeamChat run, and flipping it to ignored races that path.
    */
   async resolveDeferredMessage(
     externalMessageId: string,
@@ -286,12 +305,8 @@ export class TeamChatBridge {
     const result = await this.deps.prisma.externalMessage.updateMany({
       where: {
         id: externalMessageId,
-        ...(resolution === "routine"
-          ? {
-              status: { in: ["deferred", "received", "observed", "queueing"] },
-              runId: null,
-            }
-          : { status: "deferred" }),
+        status:
+          resolution === "routine" ? { in: ["deferred", "received", "observed"] } : "deferred",
         externalConversation: { provider: this.deps.providerId, botId: target.id },
       },
       data:
