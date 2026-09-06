@@ -109,7 +109,8 @@ describe("team chat bridge", () => {
     expect(updateMany).toHaveBeenLastCalledWith({
       where: {
         id: "external-deferred",
-        status: { in: ["deferred", "received", "observed"] },
+        status: { in: ["deferred", "received", "observed", "queueing"] },
+        runId: null,
         externalConversation: { provider: "slack", botId: "bot-1" },
       },
       data: {
@@ -337,7 +338,8 @@ describe("team chat bridge", () => {
     expect(updateMany).toHaveBeenCalledWith({
       where: {
         id: "external-raced",
-        status: { in: ["deferred", "received", "observed"] },
+        status: { in: ["deferred", "received", "observed", "queueing"] },
+        runId: null,
         externalConversation: { provider: "slack", botId: "bot-1" },
       },
       data: {
@@ -346,6 +348,39 @@ describe("team chat bridge", () => {
         nextAttemptAt: null,
       },
     });
+  });
+
+  it("extends deferred routing leases for thirty minutes", async () => {
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+    const bridge = new TeamChatBridge({
+      prisma: { externalMessage: { updateMany } } as unknown as PrismaClient,
+      events: { sendUserMessage: vi.fn() },
+      jobs: { enqueue: vi.fn() },
+      send: vi.fn(),
+      providerId: "slack",
+      botId: "bot-1",
+    });
+    (
+      bridge as unknown as {
+        target: { id: string; spaceId: string; userId: string; name: string };
+      }
+    ).target = { id: "bot-1", spaceId: "space-1", userId: "owner-1", name: "Chief" };
+
+    const before = Date.now();
+    await expect(bridge.extendDeferredReservation("external-deferred")).resolves.toBe(true);
+    const after = Date.now();
+    expect(updateMany).toHaveBeenCalledWith({
+      where: {
+        id: "external-deferred",
+        status: "deferred",
+        externalConversation: { provider: "slack", botId: "bot-1" },
+      },
+      data: { nextAttemptAt: expect.any(Date) },
+    });
+    const nextAttemptAt = (updateMany.mock.calls[0]![0] as { data: { nextAttemptAt: Date } }).data
+      .nextAttemptAt;
+    expect(nextAttemptAt.getTime()).toBeGreaterThanOrEqual(before + 25 * 60_000);
+    expect(nextAttemptAt.getTime()).toBeLessThanOrEqual(after + 30 * 60_000);
   });
 
   it("does not queue a received message that already woke a message routine", async () => {
@@ -399,6 +434,74 @@ describe("team chat bridge", () => {
     expect(findUnique).toHaveBeenCalled();
     expect(updateMany).toHaveBeenCalledWith({
       where: { id: "external-received", status: "received" },
+      data: {
+        status: "ignored",
+        engagementReason: "message_routine_wake",
+        nextAttemptAt: null,
+      },
+    });
+    expect(sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("abandons a queueing reservation when the wake nonce appears after claim", async () => {
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+    const findUnique = vi
+      .fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ id: "msg-routine-wake" });
+    const sendUserMessage = vi.fn();
+    const bridge = new TeamChatBridge({
+      prisma: {
+        externalMessage: { updateMany },
+        message: { findUnique },
+      } as unknown as PrismaClient,
+      events: { sendUserMessage },
+      jobs: { enqueue: vi.fn() },
+      send: vi.fn(),
+      providerId: "slack",
+      botId: "bot-1",
+    });
+
+    await (
+      bridge as unknown as {
+        queue(message: {
+          id: string;
+          providerEventId: string;
+          senderId: string;
+          senderName: string;
+          content: string;
+          batchContext: null;
+          externalConversation: {
+            spaceId: string;
+            botId: string;
+            userId: string;
+            thread: { id: string };
+          };
+        }): Promise<void>;
+      }
+    ).queue({
+      id: "external-claimed",
+      providerEventId: "Ev-woken",
+      senderId: "U-1",
+      senderName: "Ada",
+      content: "hello",
+      batchContext: null,
+      externalConversation: {
+        spaceId: "space-1",
+        botId: "bot-1",
+        userId: "owner-1",
+        thread: { id: "thread-1" },
+      },
+    });
+
+    expect(updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "external-claimed", status: "received" },
+        data: expect.objectContaining({ status: "queueing" }),
+      }),
+    );
+    expect(updateMany).toHaveBeenCalledWith({
+      where: { id: "external-claimed", status: "queueing", runId: null },
       data: {
         status: "ignored",
         engagementReason: "message_routine_wake",

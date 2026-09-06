@@ -19,6 +19,8 @@ const AMBIENT_BATCH_SIZE = 100;
 const AMBIENT_CONTEXT_MESSAGES = 20;
 const AMBIENT_CONTEXT_MESSAGE_CHARS = 2_000;
 const DEFERRED_RESERVATION_MS = 2 * 60_000;
+/** Hold the deferred row while routine routing may still be writing its wake nonce. */
+const ROUTING_RESERVATION_MS = 30 * 60_000;
 const QUEUE_RESERVATION_MS = 2 * 60_000;
 const DELIVERY_RESERVATION_MS = 2 * 60_000;
 
@@ -261,15 +263,18 @@ export class TeamChatBridge {
         status: "deferred",
         externalConversation: { provider: this.deps.providerId, botId: target.id },
       },
-      data: { nextAttemptAt: new Date(Date.now() + DEFERRED_RESERVATION_MS) },
+      // Routing can outlive the short deferred window; hold long enough for the
+      // wake nonce to commit before reconcile is allowed to promote the row.
+      data: { nextAttemptAt: new Date(Date.now() + ROUTING_RESERVATION_MS) },
     });
     return result.count === 1;
   }
 
   /**
    * Resolve a deferred message before the reconciler is allowed to claim it.
-   * Routine ownership may also reclaim `received` / `observed` rows when the
-   * deferred lease expired mid-wake before this resolve ran.
+   * Routine ownership may also reclaim `received` / `observed` / `queueing`
+   * rows (with no linked run) when the deferred lease expired mid-wake before
+   * this resolve ran.
    */
   async resolveDeferredMessage(
     externalMessageId: string,
@@ -281,8 +286,12 @@ export class TeamChatBridge {
     const result = await this.deps.prisma.externalMessage.updateMany({
       where: {
         id: externalMessageId,
-        status:
-          resolution === "routine" ? { in: ["deferred", "received", "observed"] } : "deferred",
+        ...(resolution === "routine"
+          ? {
+              status: { in: ["deferred", "received", "observed", "queueing"] },
+              runId: null,
+            }
+          : { status: "deferred" }),
         externalConversation: { provider: this.deps.providerId, botId: target.id },
       },
       data:
@@ -775,22 +784,24 @@ export class TeamChatBridge {
   }): Promise<void> {
     const thread = message.externalConversation.thread;
     if (!thread) throw new Error("Team chat conversation has no Rakazo thread");
+    const wakeNonce = inboundDeliveryClientNonce(
+      "messaging",
+      message.externalConversation.botId,
+      messagingWakeIdempotencyKey(this.deps.providerId, message.providerEventId),
+    );
+    const findWake = () =>
+      this.deps.prisma.message.findUnique({
+        where: {
+          threadId_clientNonce: {
+            threadId: thread.id,
+            clientNonce: wakeNonce,
+          },
+        },
+        select: { id: true },
+      });
     // Lease recovery may have promoted this row before wake finished. If the
     // messaging routine nonce now exists, do not start a fallback agent run.
-    const woken = await this.deps.prisma.message.findUnique({
-      where: {
-        threadId_clientNonce: {
-          threadId: thread.id,
-          clientNonce: inboundDeliveryClientNonce(
-            "messaging",
-            message.externalConversation.botId,
-            messagingWakeIdempotencyKey(this.deps.providerId, message.providerEventId),
-          ),
-        },
-      },
-      select: { id: true },
-    });
-    if (woken) {
+    if (await findWake()) {
       await this.deps.prisma.externalMessage.updateMany({
         where: { id: message.id, status: "received" },
         data: {
@@ -809,6 +820,18 @@ export class TeamChatBridge {
       },
     });
     if (claimed.count !== 1) return;
+    // Wake may commit between the pre-claim check and this reservation.
+    if (await findWake()) {
+      await this.deps.prisma.externalMessage.updateMany({
+        where: { id: message.id, status: "queueing", runId: null },
+        data: {
+          status: "ignored",
+          engagementReason: "message_routine_wake",
+          nextAttemptAt: null,
+        },
+      });
+      return;
+    }
     const prompt =
       message.batchContext ??
       teamChatPrompt(this.deps.providerId, message.senderName, message.content);
