@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   JobPublisher,
   TeamChatInboundMessage,
@@ -20,6 +21,13 @@ const AMBIENT_CONTEXT_MESSAGE_CHARS = 2_000;
 const DEFERRED_RESERVATION_MS = 2 * 60_000;
 const QUEUE_RESERVATION_MS = 2 * 60_000;
 const DELIVERY_RESERVATION_MS = 2 * 60_000;
+
+/** Must match deliverWebhookEvent(source: "messaging", idempotencyKey: `${provider}:${handle}`). */
+function messagingRoutineWakeNonce(botId: string, provider: string, handle: string): string {
+  return `messaging:${botId}:${createHash("sha256")
+    .update(`${provider}:${handle}`)
+    .digest("base64url")}`;
+}
 
 interface TeamChatBridgeDeps {
   prisma: PrismaClient;
@@ -336,6 +344,68 @@ export class TeamChatBridge {
     });
   }
 
+  /**
+   * Promote expired deferred leases. If wakeMessageRoutines already persisted a
+   * routine run (crash before resolveDeferredMessage), mark the row ignored so
+   * recovery cannot also start a TeamChat agent run for the same provider event.
+   */
+  private async recoverExpiredDeferredMessages(target: TargetBot, now: Date): Promise<void> {
+    const expired = await this.deps.prisma.externalMessage.findMany({
+      where: {
+        status: "deferred",
+        nextAttemptAt: { lte: now },
+        externalConversation: {
+          provider: this.deps.providerId,
+          botId: target.id,
+        },
+      },
+      select: {
+        id: true,
+        kind: true,
+        providerEventId: true,
+        externalConversation: { select: { thread: { select: { id: true } } } },
+      },
+      orderBy: { createdAt: "asc" },
+      take: BATCH_SIZE,
+    });
+    for (const message of expired) {
+      const threadId = message.externalConversation.thread?.id;
+      const woken = threadId
+        ? await this.deps.prisma.message.findUnique({
+            where: {
+              threadId_clientNonce: {
+                threadId,
+                clientNonce: messagingRoutineWakeNonce(
+                  target.id,
+                  this.deps.providerId,
+                  message.providerEventId,
+                ),
+              },
+            },
+            select: { id: true },
+          })
+        : null;
+      if (woken) {
+        await this.deps.prisma.externalMessage.updateMany({
+          where: { id: message.id, status: "deferred" },
+          data: {
+            status: "ignored",
+            engagementReason: "message_routine_wake",
+            nextAttemptAt: null,
+          },
+        });
+        continue;
+      }
+      await this.deps.prisma.externalMessage.updateMany({
+        where: { id: message.id, status: "deferred" },
+        data: {
+          status: message.kind === "ambient" ? "observed" : "received",
+          nextAttemptAt: null,
+        },
+      });
+    }
+  }
+
   async reconcileOnce(): Promise<void> {
     if (this.reconciling) return this.reconciling;
     this.reconciling = this.reconcile().finally(() => {
@@ -348,30 +418,7 @@ export class TeamChatBridge {
     const target = this.target;
     if (!target) return;
     const now = new Date();
-    await this.deps.prisma.externalMessage.updateMany({
-      where: {
-        status: "deferred",
-        kind: "ambient",
-        nextAttemptAt: { lte: now },
-        externalConversation: {
-          provider: this.deps.providerId,
-          botId: target.id,
-        },
-      },
-      data: { status: "observed", nextAttemptAt: null },
-    });
-    await this.deps.prisma.externalMessage.updateMany({
-      where: {
-        status: "deferred",
-        kind: { not: "ambient" },
-        nextAttemptAt: { lte: now },
-        externalConversation: {
-          provider: this.deps.providerId,
-          botId: target.id,
-        },
-      },
-      data: { status: "received", nextAttemptAt: null },
-    });
+    await this.recoverExpiredDeferredMessages(target, now);
     await this.deps.prisma.externalMessage.updateMany({
       where: {
         status: "queueing",

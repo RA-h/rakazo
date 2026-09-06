@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { TeamChatInboundMessage, TeamChatSendRequest } from "@rakazo/adapter-kit";
 import type { MessageBlock } from "@rakazo/contracts";
 import type { PrismaClient } from "@rakazo/db";
@@ -126,12 +127,26 @@ describe("team chat bridge", () => {
 
   it("recovers expired deferred reservations before normal reconciliation", async () => {
     const updateMany = vi.fn(async () => ({ count: 0 }));
+    const findMany = vi.fn(async ({ where }: { where: { status?: string } }) =>
+      where.status === "deferred"
+        ? [
+            {
+              id: "external-expired",
+              kind: "mention",
+              providerEventId: "Ev-expired",
+              externalConversation: { thread: { id: "thread-1" } },
+            },
+          ]
+        : [],
+    );
+    const findUnique = vi.fn(async () => null);
     const bridge = new TeamChatBridge({
       prisma: {
         externalMessage: {
           updateMany,
-          findMany: vi.fn(async () => []),
+          findMany,
         },
+        message: { findUnique },
         run: { findMany: vi.fn(async () => []) },
       } as unknown as PrismaClient,
       events: { sendUserMessage: vi.fn() },
@@ -148,22 +163,79 @@ describe("team chat bridge", () => {
 
     await bridge.reconcileOnce();
 
-    expect(updateMany).toHaveBeenNthCalledWith(1, {
-      where: {
-        status: "deferred",
-        kind: "ambient",
-        nextAttemptAt: { lte: expect.any(Date) },
-        externalConversation: { provider: "slack", botId: "bot-1" },
-      },
-      data: { status: "observed", nextAttemptAt: null },
+    expect(findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          status: "deferred",
+          nextAttemptAt: { lte: expect.any(Date) },
+        }),
+      }),
+    );
+    expect(updateMany).toHaveBeenCalledWith({
+      where: { id: "external-expired", status: "deferred" },
+      data: { status: "received", nextAttemptAt: null },
     });
-    expect(updateMany).toHaveBeenNthCalledWith(2, {
+  });
+
+  it("ignores expired deferred messages that already woke a message routine", async () => {
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+    const findMany = vi.fn(async ({ where }: { where: { status?: string } }) =>
+      where.status === "deferred"
+        ? [
+            {
+              id: "external-woken",
+              kind: "mention",
+              providerEventId: "Ev-woken",
+              externalConversation: { thread: { id: "thread-1" } },
+            },
+          ]
+        : [],
+    );
+    const findUnique = vi.fn(async () => ({ id: "msg-routine-wake" }));
+    const bridge = new TeamChatBridge({
+      prisma: {
+        externalMessage: {
+          updateMany,
+          findMany,
+        },
+        message: { findUnique },
+        run: { findMany: vi.fn(async () => []) },
+      } as unknown as PrismaClient,
+      events: { sendUserMessage: vi.fn() },
+      jobs: { enqueue: vi.fn() },
+      send: vi.fn(),
+      providerId: "slack",
+      botId: "bot-1",
+    });
+    (
+      bridge as unknown as {
+        target: { id: string; spaceId: string; userId: string; name: string };
+      }
+    ).target = { id: "bot-1", spaceId: "space-1", userId: "owner-1", name: "Chief" };
+
+    await bridge.reconcileOnce();
+
+    expect(findUnique).toHaveBeenCalledWith({
       where: {
-        status: "deferred",
-        kind: { not: "ambient" },
-        nextAttemptAt: { lte: expect.any(Date) },
-        externalConversation: { provider: "slack", botId: "bot-1" },
+        threadId_clientNonce: {
+          threadId: "thread-1",
+          clientNonce: `messaging:bot-1:${createHash("sha256")
+            .update("slack:Ev-woken")
+            .digest("base64url")}`,
+        },
       },
+      select: { id: true },
+    });
+    expect(updateMany).toHaveBeenCalledWith({
+      where: { id: "external-woken", status: "deferred" },
+      data: {
+        status: "ignored",
+        engagementReason: "message_routine_wake",
+        nextAttemptAt: null,
+      },
+    });
+    expect(updateMany).not.toHaveBeenCalledWith({
+      where: { id: "external-woken", status: "deferred" },
       data: { status: "received", nextAttemptAt: null },
     });
   });
