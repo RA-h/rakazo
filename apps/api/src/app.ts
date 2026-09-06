@@ -555,12 +555,16 @@ export async function createApp(
           try {
             woken = await wakeMessageRoutines(inboundDeps, target, event);
           } catch (error) {
-            await teamChatBridge.resolveDeferredMessage(mapped.eventId, "agent", mapped.kind);
+            await teamChatBridge.resolveDeferredMessage(
+              target.externalMessageId,
+              "agent",
+              mapped.kind,
+            );
             await teamChatBridge.reconcileOnce();
             throw error;
           }
           await teamChatBridge.resolveDeferredMessage(
-            mapped.eventId,
+            target.externalMessageId,
             woken ? "routine" : "agent",
             mapped.kind,
           );

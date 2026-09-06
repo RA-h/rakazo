@@ -17,6 +17,7 @@ const BATCH_SIZE = 20;
 const AMBIENT_BATCH_SIZE = 100;
 const AMBIENT_CONTEXT_MESSAGES = 20;
 const AMBIENT_CONTEXT_MESSAGE_CHARS = 2_000;
+const DEFERRED_RESERVATION_MS = 2 * 60_000;
 const QUEUE_RESERVATION_MS = 2 * 60_000;
 const DELIVERY_RESERVATION_MS = 2 * 60_000;
 
@@ -48,7 +49,10 @@ export type TeamChatInboundTarget = {
   threadId: string;
 };
 
-type DeferredTeamChatInboundTarget = TeamChatInboundTarget & { deferred: boolean };
+type DeferredTeamChatInboundTarget = TeamChatInboundTarget & {
+  deferred: boolean;
+  externalMessageId: string;
+};
 
 export function teamChatPrompt(provider: string, senderName: string, content: string): string {
   const label = provider.charAt(0).toUpperCase() + provider.slice(1);
@@ -178,6 +182,8 @@ export class TeamChatBridge {
     ) {
       throw new Error("Team chat conversation belongs to a different Rakazo target");
     }
+    const now = new Date();
+    const deferredUntil = new Date(now.getTime() + DEFERRED_RESERVATION_MS);
     const externalMessage = await this.deps.prisma.externalMessage.upsert({
       where: {
         externalConversationId_providerEventId: {
@@ -200,17 +206,25 @@ export class TeamChatBridge {
             : message.kind === "ambient"
               ? "observed"
               : "received",
+        nextAttemptAt: options?.queueAgent === false ? deferredUntil : null,
       },
       update: {},
     });
     await this.ensureTranscriptMessage(externalMessage, conversation);
     if (options?.queueAgent === false) {
       const deferred =
-        externalMessage.status === "deferred" ||
+        (externalMessage.status === "deferred" &&
+          externalMessage.nextAttemptAt?.getTime() === deferredUntil.getTime()) ||
         (
           await this.deps.prisma.externalMessage.updateMany({
-            where: { id: externalMessage.id, status: { in: ["received", "observed"] } },
-            data: { status: "deferred", nextAttemptAt: null },
+            where: {
+              id: externalMessage.id,
+              OR: [
+                { status: { in: ["received", "observed"] } },
+                { status: "deferred", nextAttemptAt: { lte: now } },
+              ],
+            },
+            data: { status: "deferred", nextAttemptAt: deferredUntil },
           })
         ).count === 1;
       return {
@@ -219,6 +233,7 @@ export class TeamChatBridge {
         botId: conversation.botId,
         threadId: conversation.thread.id,
         deferred,
+        externalMessageId: externalMessage.id,
       };
     }
     await this.reconcileOnce();
@@ -232,7 +247,7 @@ export class TeamChatBridge {
 
   /** Resolve a deferred message before the reconciler is allowed to claim it. */
   async resolveDeferredMessage(
-    providerEventId: string,
+    externalMessageId: string,
     resolution: "routine" | "agent",
     kind: TeamChatInboundMessage["kind"],
   ): Promise<boolean> {
@@ -240,14 +255,21 @@ export class TeamChatBridge {
     if (!target) return false;
     const result = await this.deps.prisma.externalMessage.updateMany({
       where: {
-        providerEventId,
+        id: externalMessageId,
         status: "deferred",
         externalConversation: { provider: this.deps.providerId, botId: target.id },
       },
       data:
         resolution === "routine"
-          ? { status: "ignored", engagementReason: "message_routine_wake" }
-          : { status: kind === "ambient" ? "observed" : "received" },
+          ? {
+              status: "ignored",
+              engagementReason: "message_routine_wake",
+              nextAttemptAt: null,
+            }
+          : {
+              status: kind === "ambient" ? "observed" : "received",
+              nextAttemptAt: null,
+            },
     });
     return result.count === 1;
   }
@@ -326,6 +348,30 @@ export class TeamChatBridge {
     const target = this.target;
     if (!target) return;
     const now = new Date();
+    await this.deps.prisma.externalMessage.updateMany({
+      where: {
+        status: "deferred",
+        kind: "ambient",
+        nextAttemptAt: { lte: now },
+        externalConversation: {
+          provider: this.deps.providerId,
+          botId: target.id,
+        },
+      },
+      data: { status: "observed", nextAttemptAt: null },
+    });
+    await this.deps.prisma.externalMessage.updateMany({
+      where: {
+        status: "deferred",
+        kind: { not: "ambient" },
+        nextAttemptAt: { lte: now },
+        externalConversation: {
+          provider: this.deps.providerId,
+          botId: target.id,
+        },
+      },
+      data: { status: "received", nextAttemptAt: null },
+    });
     await this.deps.prisma.externalMessage.updateMany({
       where: {
         status: "queueing",
@@ -854,7 +900,11 @@ export class TeamChatBridge {
     if (current.status === "delivered") return;
     // Once reserved for delivery, stay in delivering. Restoring the pre-reserve
     // "running" status would let reconciliation send again after a lost ack.
-    const status = current.status === "delivering" ? "delivering" : message.status;
+    // A queueing failure happened before the run was linked and can safely be
+    // retried from received. Once linked, preserve running so the shared run
+    // reconciler can recover a failed continuation enqueue without creating a
+    // second message/run from this stale snapshot.
+    const status = current.status === "queueing" ? "received" : current.status;
     // Conditional write: if reserveDelivery finalized between the read and this
     // update, leave the delivered/unconfirmed row alone.
     await this.deps.prisma.externalMessage.updateMany({

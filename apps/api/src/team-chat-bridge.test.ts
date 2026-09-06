@@ -102,22 +102,70 @@ describe("team chat bridge", () => {
     expect(upsert).toHaveBeenCalledWith(
       expect.objectContaining({ create: expect.objectContaining({ status: "deferred" }) }),
     );
-    await expect(bridge.resolveDeferredMessage("Ev-deferred", "routine", "mention")).resolves.toBe(
-      true,
-    );
+    await expect(
+      bridge.resolveDeferredMessage("external-deferred", "routine", "mention"),
+    ).resolves.toBe(true);
     expect(updateMany).toHaveBeenLastCalledWith({
       where: {
-        providerEventId: "Ev-deferred",
+        id: "external-deferred",
         status: "deferred",
         externalConversation: { provider: "slack", botId: "bot-1" },
       },
-      data: { status: "ignored", engagementReason: "message_routine_wake" },
+      data: {
+        status: "ignored",
+        engagementReason: "message_routine_wake",
+        nextAttemptAt: null,
+      },
     });
 
-    await bridge.resolveDeferredMessage("Ev-ambient", "agent", "ambient");
+    await bridge.resolveDeferredMessage("external-ambient", "agent", "ambient");
     expect(updateMany).toHaveBeenLastCalledWith(
-      expect.objectContaining({ data: { status: "observed" } }),
+      expect.objectContaining({ data: { status: "observed", nextAttemptAt: null } }),
     );
+  });
+
+  it("recovers expired deferred reservations before normal reconciliation", async () => {
+    const updateMany = vi.fn(async () => ({ count: 0 }));
+    const bridge = new TeamChatBridge({
+      prisma: {
+        externalMessage: {
+          updateMany,
+          findMany: vi.fn(async () => []),
+        },
+        run: { findMany: vi.fn(async () => []) },
+      } as unknown as PrismaClient,
+      events: { sendUserMessage: vi.fn() },
+      jobs: { enqueue: vi.fn() },
+      send: vi.fn(),
+      providerId: "slack",
+      botId: "bot-1",
+    });
+    (
+      bridge as unknown as {
+        target: { id: string; spaceId: string; userId: string; name: string };
+      }
+    ).target = { id: "bot-1", spaceId: "space-1", userId: "owner-1", name: "Chief" };
+
+    await bridge.reconcileOnce();
+
+    expect(updateMany).toHaveBeenNthCalledWith(1, {
+      where: {
+        status: "deferred",
+        kind: "ambient",
+        nextAttemptAt: { lte: expect.any(Date) },
+        externalConversation: { provider: "slack", botId: "bot-1" },
+      },
+      data: { status: "observed", nextAttemptAt: null },
+    });
+    expect(updateMany).toHaveBeenNthCalledWith(2, {
+      where: {
+        status: "deferred",
+        kind: { not: "ambient" },
+        nextAttemptAt: { lte: expect.any(Date) },
+        externalConversation: { provider: "slack", botId: "bot-1" },
+      },
+      data: { status: "received", nextAttemptAt: null },
+    });
   });
 
   it("does not queue a stale received snapshot after another path deferred it", async () => {
@@ -568,6 +616,48 @@ describe("team chat bridge", () => {
           attempts: 2,
           lastError: "send failed",
         }),
+      }),
+    );
+  });
+
+  it("does not reopen a linked run from a stale received snapshot", async () => {
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+    const prisma = {
+      externalMessage: {
+        findUnique: vi.fn(async () => ({
+          status: "running",
+          providerReplyHandle: null,
+        })),
+        update: vi.fn(),
+        updateMany,
+      },
+    } as unknown as PrismaClient;
+    const bridge = new TeamChatBridge({
+      prisma,
+      events: { sendUserMessage: vi.fn() },
+      jobs: { enqueue: vi.fn() },
+      send: vi.fn(),
+      providerId: "slack",
+      botId: "bot-1",
+    });
+
+    await (
+      bridge as unknown as {
+        retry: (
+          message: { id: string; status: string; attempts: number },
+          error: unknown,
+        ) => Promise<void>;
+      }
+    ).retry({ id: "message-3", status: "received", attempts: 0 }, new Error("enqueue failed"));
+
+    expect(updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: "message-3",
+          providerReplyHandle: null,
+          status: "running",
+        },
+        data: expect.objectContaining({ status: "running", lastError: "enqueue failed" }),
       }),
     );
   });
