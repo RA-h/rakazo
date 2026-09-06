@@ -85,7 +85,7 @@ import {
 } from "./messaging-inbound.js";
 import { mountMessagingWebhookRoutes } from "./messaging-webhook.js";
 import { createRouter } from "./router.js";
-import { TeamChatBridge } from "./team-chat-bridge.js";
+import { isDeferredReservationLost, TeamChatBridge } from "./team-chat-bridge.js";
 import { ModelTeamChatEngagementJudge } from "./team-chat-judge.js";
 import { mountVoiceHttpRoutes } from "./voice.js";
 import { mountWebhookHttpRoutes } from "./webhook.js";
@@ -552,29 +552,38 @@ export async function createApp(
           // the message, so the timer cannot start a second TeamChat run.
           const target = await bridge.receive(mapped, { queueAgent: false });
           if (!target.deferred) return;
-          const stopLeaseHeartbeat = await bridge.startDeferredReservationHeartbeat(
+          const heartbeat = await bridge.startDeferredReservationHeartbeat(
             target.externalMessageId,
           );
           let woken = false;
           try {
             try {
-              woken = await wakeMessageRoutines(inboundDeps, target, event, {
-                // Must match TeamChatBridge ExternalConversation / recovery provider.
-                deliveryProvider: bridge.providerId,
-              });
+              woken = await Promise.race([
+                wakeMessageRoutines(inboundDeps, target, event, {
+                  // Must match TeamChatBridge ExternalConversation / recovery provider.
+                  deliveryProvider: bridge.providerId,
+                }),
+                heartbeat.lost,
+              ]);
             } catch (error) {
+              if (isDeferredReservationLost(error)) {
+                // Ownership/recovery already owns the row; do not start a fallback agent.
+                return;
+              }
               await bridge.resolveDeferredMessage(target.externalMessageId, "agent", mapped.kind);
               await bridge.reconcileOnce();
               throw error;
             }
-            await bridge.resolveDeferredMessage(
+            const resolved = await bridge.resolveDeferredMessage(
               target.externalMessageId,
               woken ? "routine" : "agent",
               mapped.kind,
             );
+            // Failed resolution means another path claimed the message.
+            if (!resolved) return;
             if (!woken) await bridge.reconcileOnce();
           } finally {
-            stopLeaseHeartbeat();
+            heartbeat.stop();
           }
           return;
         }

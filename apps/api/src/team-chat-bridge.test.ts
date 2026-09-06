@@ -121,7 +121,9 @@ describe("team chat bridge", () => {
 
     await bridge.resolveDeferredMessage("external-ambient", "agent", "ambient");
     expect(updateMany).toHaveBeenLastCalledWith(
-      expect.objectContaining({ data: { status: "observed", nextAttemptAt: null } }),
+      expect.objectContaining({
+        data: { status: "observed", engagementReason: null, nextAttemptAt: null },
+      }),
     );
   });
 
@@ -380,19 +382,34 @@ describe("team chat bridge", () => {
       }
     ).target = { id: "bot-1", spaceId: "space-1", userId: "owner-1", name: "Chief" };
 
-    const before = Date.now();
-    await expect(bridge.extendDeferredReservation("external-deferred")).resolves.toBe(true);
-    const after = Date.now();
+    await expect(bridge.claimDeferredRoutineOwnership("external-deferred")).resolves.toBe(true);
     expect(updateMany).toHaveBeenCalledWith({
       where: {
         id: "external-deferred",
         status: "deferred",
+        OR: [{ engagementReason: null }, { engagementReason: "message_routine_routing" }],
+        externalConversation: { provider: "slack", botId: "bot-1" },
+      },
+      data: {
+        engagementReason: "message_routine_routing",
+        nextAttemptAt: expect.any(Date),
+      },
+    });
+
+    const before = Date.now();
+    await expect(bridge.extendDeferredReservation("external-deferred")).resolves.toBe(true);
+    const after = Date.now();
+    expect(updateMany).toHaveBeenLastCalledWith({
+      where: {
+        id: "external-deferred",
+        status: "deferred",
+        engagementReason: "message_routine_routing",
         externalConversation: { provider: "slack", botId: "bot-1" },
       },
       data: { nextAttemptAt: expect.any(Date) },
     });
-    const nextAttemptAt = (updateMany.mock.calls[0]![0] as { data: { nextAttemptAt: Date } }).data
-      .nextAttemptAt;
+    const nextAttemptAt = (updateMany.mock.calls.at(-1)![0] as { data: { nextAttemptAt: Date } })
+      .data.nextAttemptAt;
     expect(nextAttemptAt.getTime()).toBeGreaterThanOrEqual(before + 25 * 60_000);
     expect(nextAttemptAt.getTime()).toBeLessThanOrEqual(after + 30 * 60_000);
   });
@@ -402,8 +419,14 @@ describe("team chat bridge", () => {
     vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
     try {
       let leaseUntil = new Date(0);
+      let engagementReason: string | null = null;
       const updateMany = vi.fn(
-        async (input: { data?: { nextAttemptAt?: Date; status?: string } }) => {
+        async (input: {
+          data?: { nextAttemptAt?: Date; status?: string; engagementReason?: string | null };
+        }) => {
+          if (input.data?.engagementReason === "message_routine_routing") {
+            engagementReason = "message_routine_routing";
+          }
           if (input.data?.nextAttemptAt) leaseUntil = input.data.nextAttemptAt;
           return { count: 1 };
         },
@@ -415,6 +438,7 @@ describe("team chat bridge", () => {
                 id: "external-routing",
                 kind: "mention",
                 providerEventId: "Ev-routing",
+                engagementReason,
                 externalConversation: { thread: { id: "thread-1" } },
               },
             ]
@@ -440,12 +464,13 @@ describe("team chat bridge", () => {
 
       // Keeping the stopper open models wakeMessageRoutines still waiting on
       // delivery while reconciliation continues on its normal timer.
-      const stopHeartbeat = await bridge.startDeferredReservationHeartbeat("external-routing");
+      const heartbeat = await bridge.startDeferredReservationHeartbeat("external-routing");
       await vi.advanceTimersByTimeAsync(31 * 60_000);
       await bridge.reconcileOnce();
 
       expect(updateMany.mock.calls.length).toBeGreaterThan(30);
       expect(leaseUntil.getTime()).toBeGreaterThan(Date.now());
+      expect(engagementReason).toBe("message_routine_routing");
       expect(updateMany).not.toHaveBeenCalledWith(
         expect.objectContaining({
           where: {
@@ -457,10 +482,196 @@ describe("team chat bridge", () => {
         }),
       );
 
-      stopHeartbeat();
+      heartbeat.stop();
       const renewalsAfterRoute = updateMany.mock.calls.length;
       await vi.advanceTimersByTimeAsync(2 * 60_000);
       expect(updateMany).toHaveBeenCalledTimes(renewalsAfterRoute);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("propagates periodic lease loss and blocks fallback queueing under ownership", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    try {
+      let status = "deferred";
+      let engagementReason: string | null = null;
+      let nextAttemptAt = new Date(Date.now() + 2 * 60_000);
+      let renewals = 0;
+      const sendUserMessage = vi.fn();
+      const updateMany = vi.fn(
+        async (input: {
+          where?: {
+            id?: string;
+            status?: string | { in?: string[] };
+            nextAttemptAt?: { lte: Date };
+            NOT?: unknown;
+          };
+          data?: { nextAttemptAt?: Date; status?: string; engagementReason?: string | null };
+        }) => {
+          if (input.data?.engagementReason === "message_routine_routing" && !input.data.status) {
+            if (status !== "deferred") return { count: 0 };
+            engagementReason = "message_routine_routing";
+            if (input.data.nextAttemptAt) nextAttemptAt = input.data.nextAttemptAt;
+            return { count: 1 };
+          }
+          if (input.data?.nextAttemptAt && input.data.status === undefined) {
+            renewals += 1;
+            // First periodic renewal returns zero rows while delivery is blocked.
+            if (renewals >= 1) return { count: 0 };
+            if (status !== "deferred" || engagementReason !== "message_routine_routing") {
+              return { count: 0 };
+            }
+            nextAttemptAt = input.data.nextAttemptAt;
+            return { count: 1 };
+          }
+          if (
+            input.data?.status === "ignored" &&
+            input.where?.status === "deferred" &&
+            status === "deferred"
+          ) {
+            status = "ignored";
+            engagementReason = "message_routine_wake";
+            nextAttemptAt = new Date(0);
+            return { count: 1 };
+          }
+          if (input.data?.status === "received") {
+            if (engagementReason === "message_routine_routing") return { count: 0 };
+            status = "received";
+            return { count: 1 };
+          }
+          if (input.data?.status === "queueing") return { count: 0 };
+          if (input.data?.status === "ignored" && input.where?.status === "received") {
+            status = "ignored";
+            engagementReason = "message_routine_wake";
+            return { count: 1 };
+          }
+          return { count: 0 };
+        },
+      );
+      const findMany = vi.fn(async ({ where }: { where: { status?: string } }) => {
+        if (
+          where.status === "deferred" &&
+          status === "deferred" &&
+          nextAttemptAt.getTime() <= Date.now()
+        ) {
+          return [
+            {
+              id: "external-lost",
+              kind: "mention",
+              providerEventId: "Ev-lost",
+              engagementReason,
+              externalConversation: { thread: { id: "thread-1" } },
+            },
+          ];
+        }
+        if (where.status === "received" && status === "received") {
+          return [
+            {
+              id: "external-lost",
+              providerEventId: "Ev-lost",
+              senderId: "U-1",
+              senderName: "Ada",
+              content: "hello",
+              batchContext: null,
+              externalConversation: {
+                spaceId: "space-1",
+                botId: "bot-1",
+                userId: "owner-1",
+                thread: { id: "thread-1" },
+              },
+            },
+          ];
+        }
+        return [];
+      });
+      const bridge = new TeamChatBridge({
+        prisma: {
+          externalMessage: {
+            updateMany,
+            findMany,
+            findUnique: vi.fn(async () => ({ engagementReason })),
+          },
+          message: { findUnique: vi.fn(async () => null) },
+          run: { findMany: vi.fn(async () => []) },
+        } as unknown as PrismaClient,
+        events: { sendUserMessage },
+        jobs: { enqueue: vi.fn() },
+        send: vi.fn(),
+        providerId: "slack",
+        botId: "bot-1",
+      });
+      (
+        bridge as unknown as {
+          target: { id: string; spaceId: string; userId: string; name: string };
+        }
+      ).target = { id: "bot-1", spaceId: "space-1", userId: "owner-1", name: "Chief" };
+
+      const heartbeat = await bridge.startDeferredReservationHeartbeat("external-lost", 60_000);
+      expect(engagementReason).toBe("message_routine_routing");
+
+      // Expire the lease and let the periodic renewal observe zero rows while
+      // another reconciler runs against the still-owned deferred message.
+      nextAttemptAt = new Date(Date.now() - 1);
+      const lost = heartbeat.lost.then(
+        () => {
+          throw new Error("expected lease loss rejection");
+        },
+        (error: unknown) => error,
+      );
+      await vi.advanceTimersByTimeAsync(60_000);
+      const loss = await lost;
+      expect(loss).toBeInstanceOf(Error);
+      expect((loss as Error).message).toBe("Team chat deferred reservation was lost");
+
+      await bridge.reconcileOnce();
+      expect(status).toBe("ignored");
+      expect(engagementReason).toBe("message_routine_wake");
+      expect(sendUserMessage).not.toHaveBeenCalled();
+      expect(updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: "external-lost", status: "deferred" }),
+          data: expect.objectContaining({ status: "received" }),
+        }),
+      );
+
+      // Even a spuriously promoted received row must not queue an agent run.
+      status = "received";
+      engagementReason = "message_routine_routing";
+      await (
+        bridge as unknown as {
+          queue(message: {
+            id: string;
+            providerEventId: string;
+            senderId: string;
+            senderName: string;
+            content: string;
+            batchContext: null;
+            externalConversation: {
+              spaceId: string;
+              botId: string;
+              userId: string;
+              thread: { id: string };
+            };
+          }): Promise<void>;
+        }
+      ).queue({
+        id: "external-lost",
+        providerEventId: "Ev-lost",
+        senderId: "U-1",
+        senderName: "Ada",
+        content: "hello",
+        batchContext: null,
+        externalConversation: {
+          spaceId: "space-1",
+          botId: "bot-1",
+          userId: "owner-1",
+          thread: { id: "thread-1" },
+        },
+      });
+      expect(sendUserMessage).not.toHaveBeenCalled();
+      heartbeat.stop();
     } finally {
       vi.useRealTimers();
     }
@@ -472,7 +683,10 @@ describe("team chat bridge", () => {
     const sendUserMessage = vi.fn();
     const bridge = new TeamChatBridge({
       prisma: {
-        externalMessage: { updateMany },
+        externalMessage: {
+          updateMany,
+          findUnique: vi.fn(async () => ({ engagementReason: null })),
+        },
         message: { findUnique },
       } as unknown as PrismaClient,
       events: { sendUserMessage },
@@ -535,7 +749,10 @@ describe("team chat bridge", () => {
     const sendUserMessage = vi.fn();
     const bridge = new TeamChatBridge({
       prisma: {
-        externalMessage: { updateMany },
+        externalMessage: {
+          updateMany,
+          findUnique: vi.fn(async () => ({ engagementReason: null })),
+        },
         message: { findUnique },
       } as unknown as PrismaClient,
       events: { sendUserMessage },
@@ -579,7 +796,15 @@ describe("team chat bridge", () => {
 
     expect(updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "external-claimed", status: "received" },
+        where: {
+          id: "external-claimed",
+          status: "received",
+          NOT: {
+            engagementReason: {
+              in: ["message_routine_routing", "message_routine_wake"],
+            },
+          },
+        },
         data: expect.objectContaining({ status: "queueing" }),
       }),
     );
@@ -599,7 +824,10 @@ describe("team chat bridge", () => {
     const sendUserMessage = vi.fn();
     const bridge = new TeamChatBridge({
       prisma: {
-        externalMessage: { updateMany },
+        externalMessage: {
+          updateMany,
+          findUnique: vi.fn(async () => ({ engagementReason: null })),
+        },
         message: { findUnique: vi.fn(async () => null) },
       } as unknown as PrismaClient,
       events: { sendUserMessage },
@@ -642,7 +870,9 @@ describe("team chat bridge", () => {
     });
 
     expect(updateMany).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: "external-1", status: "received" } }),
+      expect.objectContaining({
+        where: expect.objectContaining({ id: "external-1", status: "received" }),
+      }),
     );
     expect(sendUserMessage).not.toHaveBeenCalled();
   });

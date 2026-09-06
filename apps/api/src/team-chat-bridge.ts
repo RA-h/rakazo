@@ -24,6 +24,24 @@ const ROUTING_RESERVATION_MS = 30 * 60_000;
 const ROUTING_RESERVATION_RENEWAL_MS = 60_000;
 const QUEUE_RESERVATION_MS = 2 * 60_000;
 const DELIVERY_RESERVATION_MS = 2 * 60_000;
+/** Durable claim while wakeMessageRoutines may still be creating its nonce. */
+const MESSAGE_ROUTINE_ROUTING = "message_routine_routing";
+const MESSAGE_ROUTINE_WAKE = "message_routine_wake";
+const DEFERRED_RESERVATION_LOST = "Team chat deferred reservation was lost";
+
+export type DeferredReservationHeartbeat = {
+  stop: () => void;
+  /** Rejects when a periodic renewal can no longer hold the deferred row. */
+  lost: Promise<never>;
+};
+
+export function isDeferredReservationLost(error: unknown): boolean {
+  return error instanceof Error && error.message === DEFERRED_RESERVATION_LOST;
+}
+
+function isRoutineOwned(engagementReason: string | null | undefined): boolean {
+  return engagementReason === MESSAGE_ROUTINE_ROUTING || engagementReason === MESSAGE_ROUTINE_WAKE;
+}
 
 interface TeamChatBridgeDeps {
   prisma: PrismaClient;
@@ -262,6 +280,7 @@ export class TeamChatBridge {
       where: {
         id: externalMessageId,
         status: "deferred",
+        engagementReason: MESSAGE_ROUTINE_ROUTING,
         externalConversation: { provider: this.deps.providerId, botId: target.id },
       },
       // Routing can outlive the short deferred window; hold long enough for the
@@ -271,34 +290,76 @@ export class TeamChatBridge {
     return result.count === 1;
   }
 
-  /** Refresh the deferred lease until the caller stops the heartbeat after routing settles. */
+  /**
+   * Claim exclusive routine ownership before wakeMessageRoutines runs so
+   * expired-lease recovery and queue() cannot start a fallback TeamChat agent.
+   */
+  async claimDeferredRoutineOwnership(externalMessageId: string): Promise<boolean> {
+    const target = this.target;
+    if (!target) return false;
+    const result = await this.deps.prisma.externalMessage.updateMany({
+      where: {
+        id: externalMessageId,
+        status: "deferred",
+        OR: [{ engagementReason: null }, { engagementReason: MESSAGE_ROUTINE_ROUTING }],
+        externalConversation: { provider: this.deps.providerId, botId: target.id },
+      },
+      data: {
+        engagementReason: MESSAGE_ROUTINE_ROUTING,
+        nextAttemptAt: new Date(Date.now() + ROUTING_RESERVATION_MS),
+      },
+    });
+    return result.count === 1;
+  }
+
+  /**
+   * Claim ownership and refresh the deferred lease until the caller stops the
+   * heartbeat after routing settles. `lost` rejects if a renewal can no longer
+   * hold the row so the caller can abort wakeMessageRoutines.
+   */
   async startDeferredReservationHeartbeat(
     externalMessageId: string,
     intervalMs = ROUTING_RESERVATION_RENEWAL_MS,
-  ): Promise<() => void> {
-    if (!(await this.extendDeferredReservation(externalMessageId))) {
-      throw new Error("Team chat deferred reservation was lost");
+  ): Promise<DeferredReservationHeartbeat> {
+    if (!(await this.claimDeferredRoutineOwnership(externalMessageId))) {
+      throw new Error(DEFERRED_RESERVATION_LOST);
     }
     let active = true;
     let renewing = false;
+    let rejectLost: ((error: Error) => void) | undefined;
+    const lost = new Promise<never>((_, reject) => {
+      rejectLost = reject;
+    });
+    // Callers may stop without racing `lost`; keep the rejection handled.
+    void lost.catch(() => undefined);
+    const lose = (error: unknown) => {
+      if (!active) return;
+      active = false;
+      clearInterval(timer);
+      rejectLost?.(error instanceof Error ? error : new Error(DEFERRED_RESERVATION_LOST));
+    };
     const timer = setInterval(() => {
       if (!active || renewing) return;
       renewing = true;
       void this.extendDeferredReservation(externalMessageId)
         .then((held) => {
-          if (active && !held) throw new Error("Team chat deferred reservation was lost");
+          if (active && !held) lose(new Error(DEFERRED_RESERVATION_LOST));
         })
         .catch((error) => {
           getLogger().error("team chat deferred reservation renewal failed", error);
+          lose(error);
         })
         .finally(() => {
           renewing = false;
         });
     }, intervalMs);
     timer.unref?.();
-    return () => {
-      active = false;
-      clearInterval(timer);
+    return {
+      stop: () => {
+        active = false;
+        clearInterval(timer);
+      },
+      lost,
     };
   }
 
@@ -327,11 +388,12 @@ export class TeamChatBridge {
         resolution === "routine"
           ? {
               status: "ignored",
-              engagementReason: "message_routine_wake",
+              engagementReason: MESSAGE_ROUTINE_WAKE,
               nextAttemptAt: null,
             }
           : {
               status: kind === "ambient" ? "observed" : "received",
+              engagementReason: null,
               nextAttemptAt: null,
             },
     });
@@ -402,8 +464,9 @@ export class TeamChatBridge {
 
   /**
    * Promote expired deferred leases. If wakeMessageRoutines already persisted a
-   * routine run (crash before resolveDeferredMessage), mark the row ignored so
-   * recovery cannot also start a TeamChat agent run for the same provider event.
+   * routine run (crash before resolveDeferredMessage), or routine routing still
+   * holds durable ownership, mark the row ignored so recovery cannot also start
+   * a TeamChat agent run for the same provider event.
    */
   private async recoverExpiredDeferredMessages(target: TargetBot, now: Date): Promise<void> {
     const expired = await this.deps.prisma.externalMessage.findMany({
@@ -419,6 +482,7 @@ export class TeamChatBridge {
         id: true,
         kind: true,
         providerEventId: true,
+        engagementReason: true,
         externalConversation: { select: { thread: { select: { id: true } } } },
       },
       orderBy: { createdAt: "asc" },
@@ -441,12 +505,12 @@ export class TeamChatBridge {
             select: { id: true },
           })
         : null;
-      if (woken) {
+      if (woken || isRoutineOwned(message.engagementReason)) {
         await this.deps.prisma.externalMessage.updateMany({
           where: { id: message.id, status: "deferred", nextAttemptAt: { lte: now } },
           data: {
             status: "ignored",
-            engagementReason: "message_routine_wake",
+            engagementReason: MESSAGE_ROUTINE_WAKE,
             nextAttemptAt: null,
           },
         });
@@ -828,21 +892,34 @@ export class TeamChatBridge {
         },
         select: { id: true },
       });
-    // Lease recovery may have promoted this row before wake finished. If the
-    // messaging routine nonce now exists, do not start a fallback agent run.
-    if (await findWake()) {
+    const ignoreRoutineOwned = async () => {
       await this.deps.prisma.externalMessage.updateMany({
         where: { id: message.id, status: "received" },
         data: {
           status: "ignored",
-          engagementReason: "message_routine_wake",
+          engagementReason: MESSAGE_ROUTINE_WAKE,
           nextAttemptAt: null,
         },
       });
+    };
+    const owned = await this.deps.prisma.externalMessage.findUnique({
+      where: { id: message.id },
+      select: { engagementReason: true },
+    });
+    // Durable routine ownership (or a completed wake) must never fall through
+    // into a TeamChat agent run for the same provider event.
+    if (isRoutineOwned(owned?.engagementReason) || (await findWake())) {
+      await ignoreRoutineOwned();
       return;
     }
     const claimed = await this.deps.prisma.externalMessage.updateMany({
-      where: { id: message.id, status: "received" },
+      where: {
+        id: message.id,
+        status: "received",
+        NOT: {
+          engagementReason: { in: [MESSAGE_ROUTINE_ROUTING, MESSAGE_ROUTINE_WAKE] },
+        },
+      },
       data: {
         status: "queueing",
         nextAttemptAt: new Date(Date.now() + QUEUE_RESERVATION_MS),
@@ -855,7 +932,7 @@ export class TeamChatBridge {
         where: { id: message.id, status: "queueing", runId: null },
         data: {
           status: "ignored",
-          engagementReason: "message_routine_wake",
+          engagementReason: MESSAGE_ROUTINE_WAKE,
           nextAttemptAt: null,
         },
       });
