@@ -551,6 +551,9 @@ export async function createApp(
           // the message, so the timer cannot start a second TeamChat run.
           const target = await teamChatBridge.receive(mapped, { queueAgent: false });
           if (!target.deferred) return;
+          // Refresh the deferred lease before potentially slow routine routing so
+          // reconcile cannot promote the row mid-wake.
+          await teamChatBridge.extendDeferredReservation(target.externalMessageId);
           let woken: boolean;
           try {
             woken = await wakeMessageRoutines(inboundDeps, target, event);

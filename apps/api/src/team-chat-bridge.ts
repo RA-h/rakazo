@@ -246,7 +246,26 @@ export class TeamChatBridge {
     };
   }
 
-  /** Resolve a deferred message before the reconciler is allowed to claim it. */
+  /** Keep a deferred lease alive while routine routing is still in progress. */
+  async extendDeferredReservation(externalMessageId: string): Promise<boolean> {
+    const target = this.target;
+    if (!target) return false;
+    const result = await this.deps.prisma.externalMessage.updateMany({
+      where: {
+        id: externalMessageId,
+        status: "deferred",
+        externalConversation: { provider: this.deps.providerId, botId: target.id },
+      },
+      data: { nextAttemptAt: new Date(Date.now() + DEFERRED_RESERVATION_MS) },
+    });
+    return result.count === 1;
+  }
+
+  /**
+   * Resolve a deferred message before the reconciler is allowed to claim it.
+   * Routine ownership may also reclaim `received` / `observed` rows when the
+   * deferred lease expired mid-wake before this resolve ran.
+   */
   async resolveDeferredMessage(
     externalMessageId: string,
     resolution: "routine" | "agent",
@@ -257,7 +276,8 @@ export class TeamChatBridge {
     const result = await this.deps.prisma.externalMessage.updateMany({
       where: {
         id: externalMessageId,
-        status: "deferred",
+        status:
+          resolution === "routine" ? { in: ["deferred", "received", "observed"] } : "deferred",
         externalConversation: { provider: this.deps.providerId, botId: target.id },
       },
       data:
@@ -750,6 +770,32 @@ export class TeamChatBridge {
   }): Promise<void> {
     const thread = message.externalConversation.thread;
     if (!thread) throw new Error("Team chat conversation has no Rakazo thread");
+    // Lease recovery may have promoted this row before wake finished. If the
+    // messaging routine nonce now exists, do not start a fallback agent run.
+    const woken = await this.deps.prisma.message.findUnique({
+      where: {
+        threadId_clientNonce: {
+          threadId: thread.id,
+          clientNonce: inboundDeliveryClientNonce(
+            "messaging",
+            message.externalConversation.botId,
+            `${this.deps.providerId}:${message.providerEventId}`,
+          ),
+        },
+      },
+      select: { id: true },
+    });
+    if (woken) {
+      await this.deps.prisma.externalMessage.updateMany({
+        where: { id: message.id, status: "received" },
+        data: {
+          status: "ignored",
+          engagementReason: "message_routine_wake",
+          nextAttemptAt: null,
+        },
+      });
+      return;
+    }
     const claimed = await this.deps.prisma.externalMessage.updateMany({
       where: { id: message.id, status: "received" },
       data: {

@@ -108,7 +108,7 @@ describe("team chat bridge", () => {
     expect(updateMany).toHaveBeenLastCalledWith({
       where: {
         id: "external-deferred",
-        status: "deferred",
+        status: { in: ["deferred", "received", "observed"] },
         externalConversation: { provider: "slack", botId: "bot-1" },
       },
       data: {
@@ -238,11 +238,107 @@ describe("team chat bridge", () => {
     });
   });
 
+  it("reclaims a received row when routine resolve races lease expiry", async () => {
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+    const bridge = new TeamChatBridge({
+      prisma: { externalMessage: { updateMany } } as unknown as PrismaClient,
+      events: { sendUserMessage: vi.fn() },
+      jobs: { enqueue: vi.fn() },
+      send: vi.fn(),
+      providerId: "slack",
+      botId: "bot-1",
+    });
+    (
+      bridge as unknown as {
+        target: { id: string; spaceId: string; userId: string; name: string };
+      }
+    ).target = { id: "bot-1", spaceId: "space-1", userId: "owner-1", name: "Chief" };
+
+    await expect(
+      bridge.resolveDeferredMessage("external-raced", "routine", "mention"),
+    ).resolves.toBe(true);
+    expect(updateMany).toHaveBeenCalledWith({
+      where: {
+        id: "external-raced",
+        status: { in: ["deferred", "received", "observed"] },
+        externalConversation: { provider: "slack", botId: "bot-1" },
+      },
+      data: {
+        status: "ignored",
+        engagementReason: "message_routine_wake",
+        nextAttemptAt: null,
+      },
+    });
+  });
+
+  it("does not queue a received message that already woke a message routine", async () => {
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+    const findUnique = vi.fn(async () => ({ id: "msg-routine-wake" }));
+    const sendUserMessage = vi.fn();
+    const bridge = new TeamChatBridge({
+      prisma: {
+        externalMessage: { updateMany },
+        message: { findUnique },
+      } as unknown as PrismaClient,
+      events: { sendUserMessage },
+      jobs: { enqueue: vi.fn() },
+      send: vi.fn(),
+      providerId: "slack",
+      botId: "bot-1",
+    });
+
+    await (
+      bridge as unknown as {
+        queue(message: {
+          id: string;
+          providerEventId: string;
+          senderId: string;
+          senderName: string;
+          content: string;
+          batchContext: null;
+          externalConversation: {
+            spaceId: string;
+            botId: string;
+            userId: string;
+            thread: { id: string };
+          };
+        }): Promise<void>;
+      }
+    ).queue({
+      id: "external-received",
+      providerEventId: "Ev-woken",
+      senderId: "U-1",
+      senderName: "Ada",
+      content: "hello",
+      batchContext: null,
+      externalConversation: {
+        spaceId: "space-1",
+        botId: "bot-1",
+        userId: "owner-1",
+        thread: { id: "thread-1" },
+      },
+    });
+
+    expect(findUnique).toHaveBeenCalled();
+    expect(updateMany).toHaveBeenCalledWith({
+      where: { id: "external-received", status: "received" },
+      data: {
+        status: "ignored",
+        engagementReason: "message_routine_wake",
+        nextAttemptAt: null,
+      },
+    });
+    expect(sendUserMessage).not.toHaveBeenCalled();
+  });
+
   it("does not queue a stale received snapshot after another path deferred it", async () => {
     const updateMany = vi.fn(async () => ({ count: 0 }));
     const sendUserMessage = vi.fn();
     const bridge = new TeamChatBridge({
-      prisma: { externalMessage: { updateMany } } as unknown as PrismaClient,
+      prisma: {
+        externalMessage: { updateMany },
+        message: { findUnique: vi.fn(async () => null) },
+      } as unknown as PrismaClient,
       events: { sendUserMessage },
       jobs: { enqueue: vi.fn() },
       send: vi.fn(),
@@ -450,6 +546,7 @@ describe("team chat bridge", () => {
       },
       run: { findMany: vi.fn(async () => []) },
       message: {
+        findUnique: vi.fn(async () => null),
         findFirst: vi.fn(async () => ({
           blocks: [{ kind: "text", text: "The launch plan is ready." }],
         })),
