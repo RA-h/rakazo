@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type {
   JobPublisher,
   TeamChatInboundMessage,
@@ -11,6 +10,7 @@ import { BOT_MESSAGE_MAX_HOPS } from "@rakazo/core";
 import type { PrismaClient, ThreadEvents } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import type { TeamChatEngagementJudge } from "./team-chat-judge.js";
+import { inboundDeliveryClientNonce } from "./webhook-inbound.js";
 
 const DEFAULT_RECONCILE_INTERVAL_MS = 1_000;
 const DEFAULT_AMBIENT_DEBOUNCE_MS = 15_000;
@@ -21,13 +21,6 @@ const AMBIENT_CONTEXT_MESSAGE_CHARS = 2_000;
 const DEFERRED_RESERVATION_MS = 2 * 60_000;
 const QUEUE_RESERVATION_MS = 2 * 60_000;
 const DELIVERY_RESERVATION_MS = 2 * 60_000;
-
-/** Must match deliverWebhookEvent(source: "messaging", idempotencyKey: `${provider}:${handle}`). */
-function messagingRoutineWakeNonce(botId: string, provider: string, handle: string): string {
-  return `messaging:${botId}:${createHash("sha256")
-    .update(`${provider}:${handle}`)
-    .digest("base64url")}`;
-}
 
 interface TeamChatBridgeDeps {
   prisma: PrismaClient;
@@ -375,10 +368,10 @@ export class TeamChatBridge {
             where: {
               threadId_clientNonce: {
                 threadId,
-                clientNonce: messagingRoutineWakeNonce(
+                clientNonce: inboundDeliveryClientNonce(
+                  "messaging",
                   target.id,
-                  this.deps.providerId,
-                  message.providerEventId,
+                  `${this.deps.providerId}:${message.providerEventId}`,
                 ),
               },
             },

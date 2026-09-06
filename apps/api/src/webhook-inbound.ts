@@ -134,7 +134,15 @@ export async function loadWebhookTarget(
   };
 }
 
-/** Fan out inbound delivery into a bot message and optional continue job. */
+/** Client nonce for idempotent inbound deliveries (webhook / github / messaging). */
+export function inboundDeliveryClientNonce(
+  source: "webhook" | "github" | "messaging",
+  botId: string,
+  idempotencyKey: string,
+): string {
+  return `${source}:${botId}:${createHash("sha256").update(idempotencyKey).digest("base64url")}`;
+}
+
 export async function deliverWebhookEvent(
   deps: Pick<WebhookDeps, "events" | "jobs">,
   target: InboundTarget,
@@ -164,9 +172,7 @@ export async function deliverWebhookEvent(
       : input.prompt;
 
   const clientNonce = input.idempotencyKey
-    ? `${input.source}:${target.bot.id}:${createHash("sha256")
-        .update(input.idempotencyKey)
-        .digest("base64url")}`
+    ? inboundDeliveryClientNonce(input.source, target.bot.id, input.idempotencyKey)
     : undefined;
 
   const sent = await deps.events.sendUserMessage({

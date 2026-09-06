@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type { TeamChatInboundMessage, TeamChatSendRequest } from "@rakazo/adapter-kit";
 import type { MessageBlock } from "@rakazo/contracts";
 import type { PrismaClient } from "@rakazo/db";
@@ -219,9 +218,8 @@ describe("team chat bridge", () => {
       where: {
         threadId_clientNonce: {
           threadId: "thread-1",
-          clientNonce: `messaging:bot-1:${createHash("sha256")
-            .update("slack:Ev-woken")
-            .digest("base64url")}`,
+          // Must stay byte-identical to inboundDeliveryClientNonce("messaging", ...).
+          clientNonce: "messaging:bot-1:fw6dDvgf1cjdKO3FoWY5nio-EproO1F2I02nwb0wCeI",
         },
       },
       select: { id: true },
