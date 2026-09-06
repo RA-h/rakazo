@@ -213,6 +213,8 @@ export function RoutineEditor({
 }) {
   const { t } = useLingui();
   const fieldId = useId();
+  const slackAvailable = messageProviders.includes("slack");
+  const slackDisabledReasonId = `${fieldId}-slack-disabled-reason`;
   const hasTriggers =
     draft.schedules.length > 0 ||
     draft.webhookEnabled ||
@@ -430,17 +432,20 @@ export function RoutineEditor({
               </DropdownMenuSubContent>
             </DropdownMenuSub>
 
-            <span
-              className="block"
-              title={messageProviders.includes("slack") ? undefined : t`Slack not enabled`}
-            >
+            <span className="block" title={slackAvailable ? undefined : t`Slack not enabled`}>
               <DropdownMenuItem
-                disabled={draft.messageProvider === "slack" || !messageProviders.includes("slack")}
+                disabled={draft.messageProvider === "slack" || !slackAvailable}
+                aria-describedby={slackAvailable ? undefined : slackDisabledReasonId}
                 onClick={() => addMessageProvider("slack")}
               >
                 <MessageSquare />
                 <Trans>Slack message</Trans>
               </DropdownMenuItem>
+              {!slackAvailable ? (
+                <span id={slackDisabledReasonId} className="sr-only">
+                  <Trans>Slack not enabled</Trans>
+                </span>
+              ) : null}
             </span>
 
             {COMING_SOON.map((item) => (
