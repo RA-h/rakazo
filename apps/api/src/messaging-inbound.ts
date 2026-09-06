@@ -163,6 +163,14 @@ export async function wakeMessageRoutines(
   deps: Pick<MessagingInboundDeps, "prisma" | "events" | "jobs">,
   target: Pick<ProvisionedMessagingIdentity, "spaceId" | "userId" | "botId" | "threadId">,
   event: MessagingInboundMessage,
+  options?: {
+    /**
+     * Provider namespace for the delivery idempotency key. TeamChat recovery looks
+     * up wakes under TeamChatBridge.providerId, which can differ from
+     * event.provider for teamchat-emulator traffic.
+     */
+    deliveryProvider?: string;
+  },
 ): Promise<boolean> {
   const routines = await deps.prisma.routine.findMany({
     where: {
@@ -187,6 +195,7 @@ export async function wakeMessageRoutines(
     content: event.content,
     mediaUrl: event.mediaUrl,
   });
+  const deliveryProvider = options?.deliveryProvider ?? event.provider;
   await deliverWebhookEvent(
     { events: deps.events, jobs: deps.jobs },
     {
@@ -197,7 +206,7 @@ export async function wakeMessageRoutines(
       prompt,
       routines,
       source: "messaging",
-      idempotencyKey: `${event.provider}:${event.handle}`,
+      idempotencyKey: `${deliveryProvider}:${event.handle}`,
       // TeamChat channel wakes may share a live thread with an active chat run.
       allowParallelRun: true,
     },
