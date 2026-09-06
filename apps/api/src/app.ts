@@ -556,7 +556,10 @@ export async function createApp(
           await teamChatBridge.extendDeferredReservation(target.externalMessageId);
           let woken: boolean;
           try {
-            woken = await wakeMessageRoutines(inboundDeps, target, event);
+            woken = await wakeMessageRoutines(inboundDeps, target, event, {
+              // Must match TeamChatBridge ExternalConversation / recovery provider.
+              deliveryProvider: teamChatBridge.providerId,
+            });
           } catch (error) {
             await teamChatBridge.resolveDeferredMessage(
               target.externalMessageId,

@@ -3,7 +3,9 @@ import {
   createMessagingInboundHandler,
   type MessagingInboundDeps,
   teamChatSenderCanWakeMessageRoutines,
+  wakeMessageRoutines,
 } from "./messaging-inbound.js";
+import { inboundDeliveryClientNonce, messagingWakeIdempotencyKey } from "./webhook-inbound.js";
 
 const signupPolicy = { signupsEnabled: undefined, signupAllowlist: undefined };
 
@@ -423,6 +425,42 @@ describe("createMessagingInboundHandler DM routing", () => {
     expect(deps.sendUserMessage).toHaveBeenCalledTimes(1);
     expect(deps.sendUserMessage.mock.calls[0]?.[0]?.trigger).toBe("webhook");
     expect(deps.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it("aligns TeamChat wake nonces to deliveryProvider when inbound provider differs", async () => {
+    const deps = createDeps({
+      routines: [{ id: "routine-1", name: "Emulator triage", prompt: "Review" }],
+    });
+    const event = {
+      ...dmEvent,
+      provider: "teamchat-emulator",
+      handle: "Ev-emulator-1",
+      from: "U123",
+    };
+    await wakeMessageRoutines(
+      deps,
+      { spaceId: "ws-1", userId: "user-1", botId: "bot-1", threadId: "thread-1" },
+      event,
+      { deliveryProvider: "slack" },
+    );
+
+    const expected = inboundDeliveryClientNonce(
+      "messaging",
+      "bot-1",
+      messagingWakeIdempotencyKey("slack", "Ev-emulator-1"),
+    );
+    const mismatched = inboundDeliveryClientNonce(
+      "messaging",
+      "bot-1",
+      messagingWakeIdempotencyKey("teamchat-emulator", "Ev-emulator-1"),
+    );
+    expect(deps.sendUserMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        trigger: "webhook",
+        clientNonce: expected,
+      }),
+    );
+    expect(expected).not.toBe(mismatched);
   });
 
   it("appends inbound media links to the message text", async () => {

@@ -10,7 +10,7 @@ import { BOT_MESSAGE_MAX_HOPS } from "@rakazo/core";
 import type { PrismaClient, ThreadEvents } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import type { TeamChatEngagementJudge } from "./team-chat-judge.js";
-import { inboundDeliveryClientNonce } from "./webhook-inbound.js";
+import { inboundDeliveryClientNonce, messagingWakeIdempotencyKey } from "./webhook-inbound.js";
 
 const DEFAULT_RECONCILE_INTERVAL_MS = 1_000;
 const DEFAULT_AMBIENT_DEBOUNCE_MS = 15_000;
@@ -104,6 +104,11 @@ export class TeamChatBridge {
   private reconciling: Promise<void> | undefined;
 
   constructor(private readonly deps: TeamChatBridgeDeps) {}
+
+  /** Provider used for ExternalConversation rows and wake clientNonce recovery. */
+  get providerId(): string {
+    return this.deps.providerId;
+  }
 
   async start(): Promise<void> {
     if (this.timer) return;
@@ -391,7 +396,7 @@ export class TeamChatBridge {
                 clientNonce: inboundDeliveryClientNonce(
                   "messaging",
                   target.id,
-                  `${this.deps.providerId}:${message.providerEventId}`,
+                  messagingWakeIdempotencyKey(this.deps.providerId, message.providerEventId),
                 ),
               },
             },
@@ -779,7 +784,7 @@ export class TeamChatBridge {
           clientNonce: inboundDeliveryClientNonce(
             "messaging",
             message.externalConversation.botId,
-            `${this.deps.providerId}:${message.providerEventId}`,
+            messagingWakeIdempotencyKey(this.deps.providerId, message.providerEventId),
           ),
         },
       },

@@ -134,6 +134,11 @@ export async function loadWebhookTarget(
   };
 }
 
+/** Idempotency key shared by messaging wakes and TeamChat duplicate-skip lookups. */
+export function messagingWakeIdempotencyKey(provider: string, handle: string): string {
+  return `${provider}:${handle}`;
+}
+
 /** Client nonce for idempotent inbound deliveries (webhook / github / messaging). */
 export function inboundDeliveryClientNonce(
   source: "webhook" | "github" | "messaging",

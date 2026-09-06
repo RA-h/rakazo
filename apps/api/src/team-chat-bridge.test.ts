@@ -8,6 +8,7 @@ import {
   teamChatPrompt,
   teamChatResponseText,
 } from "./team-chat-bridge.js";
+import { inboundDeliveryClientNonce, messagingWakeIdempotencyKey } from "./webhook-inbound.js";
 
 describe("team chat bridge", () => {
   it("attributes an external speaker without changing their message", () => {
@@ -218,8 +219,11 @@ describe("team chat bridge", () => {
       where: {
         threadId_clientNonce: {
           threadId: "thread-1",
-          // Must stay byte-identical to inboundDeliveryClientNonce("messaging", ...).
-          clientNonce: "messaging:bot-1:fw6dDvgf1cjdKO3FoWY5nio-EproO1F2I02nwb0wCeI",
+          clientNonce: inboundDeliveryClientNonce(
+            "messaging",
+            "bot-1",
+            messagingWakeIdempotencyKey("slack", "Ev-woken"),
+          ),
         },
       },
       select: { id: true },
@@ -235,6 +239,79 @@ describe("team chat bridge", () => {
     expect(updateMany).not.toHaveBeenCalledWith({
       where: { id: "external-woken", status: "deferred" },
       data: { status: "received", nextAttemptAt: null },
+    });
+  });
+
+  it("recovers emulator wakes when deliveryProvider matches bridge providerId", async () => {
+    // teamchat-emulator inbound uses event.provider !== bridge.providerId ("slack").
+    // Recovery must look up the same nonce TeamChat wakes persist via deliveryProvider.
+    const eventId = "Ev-emulator-1";
+    const aligned = inboundDeliveryClientNonce(
+      "messaging",
+      "bot-1",
+      messagingWakeIdempotencyKey("slack", eventId),
+    );
+    const mismatched = inboundDeliveryClientNonce(
+      "messaging",
+      "bot-1",
+      messagingWakeIdempotencyKey("teamchat-emulator", eventId),
+    );
+    expect(aligned).not.toBe(mismatched);
+
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+    const findMany = vi.fn(async ({ where }: { where: { status?: string } }) =>
+      where.status === "deferred"
+        ? [
+            {
+              id: "external-emulator",
+              kind: "direct",
+              providerEventId: eventId,
+              externalConversation: { thread: { id: "thread-1" } },
+            },
+          ]
+        : [],
+    );
+    const findUnique = vi.fn(
+      async ({ where }: { where: { threadId_clientNonce: { clientNonce: string } } }) =>
+        where.threadId_clientNonce.clientNonce === aligned ? { id: "msg-emulator-wake" } : null,
+    );
+    const bridge = new TeamChatBridge({
+      prisma: {
+        externalMessage: { updateMany, findMany },
+        message: { findUnique },
+        run: { findMany: vi.fn(async () => []) },
+      } as unknown as PrismaClient,
+      events: { sendUserMessage: vi.fn() },
+      jobs: { enqueue: vi.fn() },
+      send: vi.fn(),
+      providerId: "slack",
+      botId: "bot-1",
+    });
+    (
+      bridge as unknown as {
+        target: { id: string; spaceId: string; userId: string; name: string };
+      }
+    ).target = { id: "bot-1", spaceId: "space-1", userId: "owner-1", name: "Chief" };
+
+    expect(bridge.providerId).toBe("slack");
+    await bridge.reconcileOnce();
+
+    expect(findUnique).toHaveBeenCalledWith({
+      where: {
+        threadId_clientNonce: {
+          threadId: "thread-1",
+          clientNonce: aligned,
+        },
+      },
+      select: { id: true },
+    });
+    expect(updateMany).toHaveBeenCalledWith({
+      where: { id: "external-emulator", status: "deferred" },
+      data: {
+        status: "ignored",
+        engagementReason: "message_routine_wake",
+        nextAttemptAt: null,
+      },
     });
   });
 

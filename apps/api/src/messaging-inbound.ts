@@ -20,6 +20,7 @@ import {
   deliverWebhookEvent,
   formatUntrustedDeliveryPayload,
   inboundEventName,
+  messagingWakeIdempotencyKey,
 } from "./webhook-inbound.js";
 
 export interface MessagingInboundDeps {
@@ -163,6 +164,14 @@ export async function wakeMessageRoutines(
   deps: Pick<MessagingInboundDeps, "prisma" | "events" | "jobs">,
   target: Pick<ProvisionedMessagingIdentity, "spaceId" | "userId" | "botId" | "threadId">,
   event: MessagingInboundMessage,
+  options?: {
+    /**
+     * Provider prefix for the wake clientNonce. TeamChat recovery looks up
+     * nonces with TeamChatBridge.providerId (often "slack"); pass that here when
+     * the inbound event.provider differs (e.g. teamchat-emulator).
+     */
+    deliveryProvider?: string;
+  },
 ): Promise<boolean> {
   const routines = await deps.prisma.routine.findMany({
     where: {
@@ -197,7 +206,10 @@ export async function wakeMessageRoutines(
       prompt,
       routines,
       source: "messaging",
-      idempotencyKey: `${event.provider}:${event.handle}`,
+      idempotencyKey: messagingWakeIdempotencyKey(
+        options?.deliveryProvider ?? event.provider,
+        event.handle,
+      ),
       // TeamChat channel wakes may share a live thread with an active chat run.
       allowParallelRun: true,
     },
