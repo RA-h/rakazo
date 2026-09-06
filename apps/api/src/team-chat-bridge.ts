@@ -274,10 +274,7 @@ export class TeamChatBridge {
    * Refresh the deferred routing lease for the whole wake. Call the returned
    * stopper when wakeMessageRoutines settles (success or failure).
    */
-  startDeferredReservationHeartbeat(
-    externalMessageId: string,
-    intervalMs = 60_000,
-  ): () => void {
+  startDeferredReservationHeartbeat(externalMessageId: string, intervalMs = 60_000): () => void {
     void this.extendDeferredReservation(externalMessageId);
     const timer = setInterval(() => {
       void this.extendDeferredReservation(externalMessageId).catch((error) => {
