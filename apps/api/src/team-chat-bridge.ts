@@ -21,6 +21,7 @@ const AMBIENT_CONTEXT_MESSAGE_CHARS = 2_000;
 const DEFERRED_RESERVATION_MS = 2 * 60_000;
 /** Hold the deferred row while routine routing may still be writing its wake nonce. */
 const ROUTING_RESERVATION_MS = 30 * 60_000;
+const ROUTING_RESERVATION_RENEWAL_MS = 60_000;
 const QUEUE_RESERVATION_MS = 2 * 60_000;
 const DELIVERY_RESERVATION_MS = 2 * 60_000;
 
@@ -270,19 +271,35 @@ export class TeamChatBridge {
     return result.count === 1;
   }
 
-  /**
-   * Refresh the deferred routing lease for the whole wake. Call the returned
-   * stopper when wakeMessageRoutines settles (success or failure).
-   */
-  startDeferredReservationHeartbeat(externalMessageId: string, intervalMs = 60_000): () => void {
-    void this.extendDeferredReservation(externalMessageId);
+  /** Refresh the deferred lease until the caller stops the heartbeat after routing settles. */
+  async startDeferredReservationHeartbeat(
+    externalMessageId: string,
+    intervalMs = ROUTING_RESERVATION_RENEWAL_MS,
+  ): Promise<() => void> {
+    if (!(await this.extendDeferredReservation(externalMessageId))) {
+      throw new Error("Team chat deferred reservation was lost");
+    }
+    let active = true;
+    let renewing = false;
     const timer = setInterval(() => {
-      void this.extendDeferredReservation(externalMessageId).catch((error) => {
-        getLogger().error("team chat deferred lease heartbeat failed", error);
-      });
+      if (!active || renewing) return;
+      renewing = true;
+      void this.extendDeferredReservation(externalMessageId)
+        .then((held) => {
+          if (active && !held) throw new Error("Team chat deferred reservation was lost");
+        })
+        .catch((error) => {
+          getLogger().error("team chat deferred reservation renewal failed", error);
+        })
+        .finally(() => {
+          renewing = false;
+        });
     }, intervalMs);
     timer.unref?.();
-    return () => clearInterval(timer);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
   }
 
   /**
@@ -426,7 +443,7 @@ export class TeamChatBridge {
         : null;
       if (woken) {
         await this.deps.prisma.externalMessage.updateMany({
-          where: { id: message.id, status: "deferred" },
+          where: { id: message.id, status: "deferred", nextAttemptAt: { lte: now } },
           data: {
             status: "ignored",
             engagementReason: "message_routine_wake",
@@ -436,7 +453,7 @@ export class TeamChatBridge {
         continue;
       }
       await this.deps.prisma.externalMessage.updateMany({
-        where: { id: message.id, status: "deferred" },
+        where: { id: message.id, status: "deferred", nextAttemptAt: { lte: now } },
         data: {
           status: message.kind === "ambient" ? "observed" : "received",
           nextAttemptAt: null,

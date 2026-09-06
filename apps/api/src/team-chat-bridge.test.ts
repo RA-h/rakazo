@@ -172,7 +172,11 @@ describe("team chat bridge", () => {
       }),
     );
     expect(updateMany).toHaveBeenCalledWith({
-      where: { id: "external-expired", status: "deferred" },
+      where: {
+        id: "external-expired",
+        status: "deferred",
+        nextAttemptAt: { lte: expect.any(Date) },
+      },
       data: { status: "received", nextAttemptAt: null },
     });
   });
@@ -229,7 +233,11 @@ describe("team chat bridge", () => {
       select: { id: true },
     });
     expect(updateMany).toHaveBeenCalledWith({
-      where: { id: "external-woken", status: "deferred" },
+      where: {
+        id: "external-woken",
+        status: "deferred",
+        nextAttemptAt: { lte: expect.any(Date) },
+      },
       data: {
         status: "ignored",
         engagementReason: "message_routine_wake",
@@ -237,7 +245,11 @@ describe("team chat bridge", () => {
       },
     });
     expect(updateMany).not.toHaveBeenCalledWith({
-      where: { id: "external-woken", status: "deferred" },
+      where: {
+        id: "external-woken",
+        status: "deferred",
+        nextAttemptAt: { lte: expect.any(Date) },
+      },
       data: { status: "received", nextAttemptAt: null },
     });
   });
@@ -306,7 +318,11 @@ describe("team chat bridge", () => {
       select: { id: true },
     });
     expect(updateMany).toHaveBeenCalledWith({
-      where: { id: "external-emulator", status: "deferred" },
+      where: {
+        id: "external-emulator",
+        status: "deferred",
+        nextAttemptAt: { lte: expect.any(Date) },
+      },
       data: {
         status: "ignored",
         engagementReason: "message_routine_wake",
@@ -381,32 +397,73 @@ describe("team chat bridge", () => {
     expect(nextAttemptAt.getTime()).toBeLessThanOrEqual(after + 30 * 60_000);
   });
 
-  it("heartbeats the deferred routing lease until stopped", async () => {
+  it("keeps renewing a deferred lease while routine delivery remains blocked", async () => {
     vi.useFakeTimers();
-    const updateMany = vi.fn(async () => ({ count: 1 }));
-    const bridge = new TeamChatBridge({
-      prisma: { externalMessage: { updateMany } } as unknown as PrismaClient,
-      events: { sendUserMessage: vi.fn() },
-      jobs: { enqueue: vi.fn() },
-      send: vi.fn(),
-      providerId: "slack",
-      botId: "bot-1",
-    });
-    (
-      bridge as unknown as {
-        target: { id: string; spaceId: string; userId: string; name: string };
-      }
-    ).target = { id: "bot-1", spaceId: "space-1", userId: "owner-1", name: "Chief" };
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    try {
+      let leaseUntil = new Date(0);
+      const updateMany = vi.fn(
+        async (input: { data?: { nextAttemptAt?: Date; status?: string } }) => {
+          if (input.data?.nextAttemptAt) leaseUntil = input.data.nextAttemptAt;
+          return { count: 1 };
+        },
+      );
+      const findMany = vi.fn(async ({ where }: { where: { status?: string } }) =>
+        where.status === "deferred" && leaseUntil.getTime() <= Date.now()
+          ? [
+              {
+                id: "external-routing",
+                kind: "mention",
+                providerEventId: "Ev-routing",
+                externalConversation: { thread: { id: "thread-1" } },
+              },
+            ]
+          : [],
+      );
+      const bridge = new TeamChatBridge({
+        prisma: {
+          externalMessage: { updateMany, findMany },
+          message: { findUnique: vi.fn(async () => null) },
+          run: { findMany: vi.fn(async () => []) },
+        } as unknown as PrismaClient,
+        events: { sendUserMessage: vi.fn() },
+        jobs: { enqueue: vi.fn() },
+        send: vi.fn(),
+        providerId: "slack",
+        botId: "bot-1",
+      });
+      (
+        bridge as unknown as {
+          target: { id: string; spaceId: string; userId: string; name: string };
+        }
+      ).target = { id: "bot-1", spaceId: "space-1", userId: "owner-1", name: "Chief" };
 
-    const stop = bridge.startDeferredReservationHeartbeat("external-deferred", 1_000);
-    expect(updateMany).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(3_000);
-    expect(updateMany.mock.calls.length).toBeGreaterThanOrEqual(4);
-    stop();
-    const callsAfterStop = updateMany.mock.calls.length;
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(updateMany).toHaveBeenCalledTimes(callsAfterStop);
-    vi.useRealTimers();
+      // Keeping the stopper open models wakeMessageRoutines still waiting on
+      // delivery while reconciliation continues on its normal timer.
+      const stopHeartbeat = await bridge.startDeferredReservationHeartbeat("external-routing");
+      await vi.advanceTimersByTimeAsync(31 * 60_000);
+      await bridge.reconcileOnce();
+
+      expect(updateMany.mock.calls.length).toBeGreaterThan(30);
+      expect(leaseUntil.getTime()).toBeGreaterThan(Date.now());
+      expect(updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            id: "external-routing",
+            status: "deferred",
+            nextAttemptAt: { lte: expect.any(Date) },
+          },
+          data: { status: "received", nextAttemptAt: null },
+        }),
+      );
+
+      stopHeartbeat();
+      const renewalsAfterRoute = updateMany.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(2 * 60_000);
+      expect(updateMany).toHaveBeenCalledTimes(renewalsAfterRoute);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not queue a received message that already woke a message routine", async () => {

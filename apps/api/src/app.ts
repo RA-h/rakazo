@@ -539,46 +539,43 @@ export async function createApp(
           event.provider === "teamchat-emulator" ||
           Boolean(event.workspaceId));
       if (preferTeamChat && teamChatBridge) {
+        const bridge = teamChatBridge;
         const mapped = toTeamChatInbound(event);
         if (mapped) {
           const canWake = await teamChatSenderCanWakeMessageRoutines(inboundDeps, event);
           if (!canWake) {
-            await teamChatBridge.receive(mapped);
+            await bridge.receive(mapped);
             return;
           }
 
           // Persist a non-reconcilable row until routine routing owns or releases
           // the message, so the timer cannot start a second TeamChat run.
-          const target = await teamChatBridge.receive(mapped, { queueAgent: false });
+          const target = await bridge.receive(mapped, { queueAgent: false });
           if (!target.deferred) return;
-          // Keep refreshing the deferred lease for the whole wake so a slow
-          // routine delivery cannot expire into a fallback TeamChat agent run.
-          const stopLeaseHeartbeat = teamChatBridge.startDeferredReservationHeartbeat(
+          const stopLeaseHeartbeat = await bridge.startDeferredReservationHeartbeat(
             target.externalMessageId,
           );
           let woken = false;
           try {
-            woken = await wakeMessageRoutines(inboundDeps, target, event, {
-              // Must match TeamChatBridge ExternalConversation / recovery provider.
-              deliveryProvider: teamChatBridge.providerId,
-            });
-          } catch (error) {
-            await teamChatBridge.resolveDeferredMessage(
+            try {
+              woken = await wakeMessageRoutines(inboundDeps, target, event, {
+                // Must match TeamChatBridge ExternalConversation / recovery provider.
+                deliveryProvider: bridge.providerId,
+              });
+            } catch (error) {
+              await bridge.resolveDeferredMessage(target.externalMessageId, "agent", mapped.kind);
+              await bridge.reconcileOnce();
+              throw error;
+            }
+            await bridge.resolveDeferredMessage(
               target.externalMessageId,
-              "agent",
+              woken ? "routine" : "agent",
               mapped.kind,
             );
-            await teamChatBridge.reconcileOnce();
-            throw error;
+            if (!woken) await bridge.reconcileOnce();
           } finally {
             stopLeaseHeartbeat();
           }
-          await teamChatBridge.resolveDeferredMessage(
-            target.externalMessageId,
-            woken ? "routine" : "agent",
-            mapped.kind,
-          );
-          if (!woken) await teamChatBridge.reconcileOnce();
           return;
         }
       }
