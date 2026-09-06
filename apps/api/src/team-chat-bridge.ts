@@ -17,6 +17,7 @@ const BATCH_SIZE = 20;
 const AMBIENT_BATCH_SIZE = 100;
 const AMBIENT_CONTEXT_MESSAGES = 20;
 const AMBIENT_CONTEXT_MESSAGE_CHARS = 2_000;
+const QUEUE_RESERVATION_MS = 2 * 60_000;
 const DELIVERY_RESERVATION_MS = 2 * 60_000;
 
 interface TeamChatBridgeDeps {
@@ -46,6 +47,8 @@ export type TeamChatInboundTarget = {
   botId: string;
   threadId: string;
 };
+
+type DeferredTeamChatInboundTarget = TeamChatInboundTarget & { deferred: boolean };
 
 export function teamChatPrompt(provider: string, senderName: string, content: string): string {
   const label = provider.charAt(0).toUpperCase() + provider.slice(1);
@@ -129,8 +132,16 @@ export class TeamChatBridge {
 
   async receive(
     message: TeamChatInboundMessage,
+    options: { queueAgent: false },
+  ): Promise<DeferredTeamChatInboundTarget>;
+  async receive(
+    message: TeamChatInboundMessage,
+    options?: { queueAgent?: true },
+  ): Promise<TeamChatInboundTarget>;
+  async receive(
+    message: TeamChatInboundMessage,
     options?: { queueAgent?: boolean },
-  ): Promise<TeamChatInboundTarget> {
+  ): Promise<TeamChatInboundTarget | DeferredTeamChatInboundTarget> {
     const target = this.target;
     if (!target) throw new Error("Team chat bridge is not started");
     const conversation = await this.deps.prisma.externalConversation.upsert({
@@ -183,17 +194,31 @@ export class TeamChatBridge {
         senderIsBot: message.senderIsBot ?? false,
         content: message.content,
         replyThreadId: message.replyThreadId,
-        status: message.kind === "ambient" ? "observed" : "received",
+        status:
+          options?.queueAgent === false
+            ? "deferred"
+            : message.kind === "ambient"
+              ? "observed"
+              : "received",
       },
       update: {},
     });
     await this.ensureTranscriptMessage(externalMessage, conversation);
     if (options?.queueAgent === false) {
+      const deferred =
+        externalMessage.status === "deferred" ||
+        (
+          await this.deps.prisma.externalMessage.updateMany({
+            where: { id: externalMessage.id, status: { in: ["received", "observed"] } },
+            data: { status: "deferred", nextAttemptAt: null },
+          })
+        ).count === 1;
       return {
         spaceId: conversation.spaceId,
         userId: conversation.userId,
         botId: conversation.botId,
         threadId: conversation.thread.id,
+        deferred,
       };
     }
     await this.reconcileOnce();
@@ -205,18 +230,26 @@ export class TeamChatBridge {
     };
   }
 
-  /** Prevent a deferred TeamChat message from later queuing a messaging run. */
-  async dismissQueuedMessage(providerEventId: string): Promise<void> {
+  /** Resolve a deferred message before the reconciler is allowed to claim it. */
+  async resolveDeferredMessage(
+    providerEventId: string,
+    resolution: "routine" | "agent",
+    kind: TeamChatInboundMessage["kind"],
+  ): Promise<boolean> {
     const target = this.target;
-    if (!target) return;
-    await this.deps.prisma.externalMessage.updateMany({
+    if (!target) return false;
+    const result = await this.deps.prisma.externalMessage.updateMany({
       where: {
         providerEventId,
-        status: "received",
+        status: "deferred",
         externalConversation: { provider: this.deps.providerId, botId: target.id },
       },
-      data: { status: "ignored", engagementReason: "message_routine_wake" },
+      data:
+        resolution === "routine"
+          ? { status: "ignored", engagementReason: "message_routine_wake" }
+          : { status: kind === "ambient" ? "observed" : "received" },
     });
+    return result.count === 1;
   }
 
   private async mirrorMissingMessages(): Promise<void> {
@@ -293,6 +326,17 @@ export class TeamChatBridge {
     const target = this.target;
     if (!target) return;
     const now = new Date();
+    await this.deps.prisma.externalMessage.updateMany({
+      where: {
+        status: "queueing",
+        nextAttemptAt: { lte: now },
+        externalConversation: {
+          provider: this.deps.providerId,
+          botId: target.id,
+        },
+      },
+      data: { status: "received", nextAttemptAt: null },
+    });
     await this.evaluateAmbient(now);
     const received = await this.deps.prisma.externalMessage.findMany({
       where: {
@@ -620,6 +664,14 @@ export class TeamChatBridge {
   }): Promise<void> {
     const thread = message.externalConversation.thread;
     if (!thread) throw new Error("Team chat conversation has no Rakazo thread");
+    const claimed = await this.deps.prisma.externalMessage.updateMany({
+      where: { id: message.id, status: "received" },
+      data: {
+        status: "queueing",
+        nextAttemptAt: new Date(Date.now() + QUEUE_RESERVATION_MS),
+      },
+    });
+    if (claimed.count !== 1) return;
     const prompt =
       message.batchContext ??
       teamChatPrompt(this.deps.providerId, message.senderName, message.content);
@@ -636,8 +688,8 @@ export class TeamChatBridge {
       allowParallelRun: true,
     });
     if (!sent.runId) throw new Error("Team chat message did not create an agent run");
-    await this.deps.prisma.externalMessage.update({
-      where: { id: message.id },
+    const linked = await this.deps.prisma.externalMessage.updateMany({
+      where: { id: message.id, status: "queueing" },
       data: {
         status: "running",
         runId: sent.runId,
@@ -645,6 +697,7 @@ export class TeamChatBridge {
         nextAttemptAt: null,
       },
     });
+    if (linked.count !== 1) throw new Error("Team chat queue reservation was lost");
     await this.deps.jobs.enqueue(runContinueJob(sent.runId));
   }
 

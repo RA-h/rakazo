@@ -542,21 +542,29 @@ export async function createApp(
         const mapped = toTeamChatInbound(event);
         if (mapped) {
           const canWake = await teamChatSenderCanWakeMessageRoutines(inboundDeps, event);
-          if (event.isDirect) {
-            // Linked DMs: routine wake XOR TeamChat messaging continue.
-            if (!canWake) {
-              await teamChatBridge.receive(mapped);
-              return;
-            }
-            const target = await teamChatBridge.receive(mapped, { queueAgent: false });
-            const woken = await wakeMessageRoutines(inboundDeps, target, event);
-            if (woken) await teamChatBridge.dismissQueuedMessage(mapped.eventId);
-            else await teamChatBridge.reconcileOnce();
+          if (!canWake) {
+            await teamChatBridge.receive(mapped);
             return;
           }
-          const target = await teamChatBridge.receive(mapped);
-          // Channel/room wakes still require personal-line approval (linked or approved).
-          if (canWake) await wakeMessageRoutines(inboundDeps, target, event);
+
+          // Persist a non-reconcilable row until routine routing owns or releases
+          // the message, so the timer cannot start a second TeamChat run.
+          const target = await teamChatBridge.receive(mapped, { queueAgent: false });
+          if (!target.deferred) return;
+          let woken: boolean;
+          try {
+            woken = await wakeMessageRoutines(inboundDeps, target, event);
+          } catch (error) {
+            await teamChatBridge.resolveDeferredMessage(mapped.eventId, "agent", mapped.kind);
+            await teamChatBridge.reconcileOnce();
+            throw error;
+          }
+          await teamChatBridge.resolveDeferredMessage(
+            mapped.eventId,
+            woken ? "routine" : "agent",
+            mapped.kind,
+          );
+          if (!woken) await teamChatBridge.reconcileOnce();
           return;
         }
       }

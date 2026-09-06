@@ -40,6 +40,136 @@ describe("team chat bridge", () => {
     expect(teamChatResponseText([])).toBe("Bot completed the request without a written reply.");
   });
 
+  it("keeps deferred messages outside reconciliation until routine routing resolves them", async () => {
+    const upsert = vi.fn(async ({ create }: { create: Record<string, unknown> }) => ({
+      id: "external-deferred",
+      ...create,
+      threadMessageId: null,
+    }));
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+    const prisma = {
+      externalConversation: {
+        upsert: vi.fn(async () => ({
+          id: "conversation-1",
+          provider: "slack",
+          spaceId: "space-1",
+          botId: "bot-1",
+          userId: "owner-1",
+          thread: { id: "thread-1" },
+        })),
+      },
+      externalMessage: {
+        upsert,
+        update: vi.fn(async () => ({})),
+        updateMany,
+      },
+    } as unknown as PrismaClient;
+    const bridge = new TeamChatBridge({
+      prisma,
+      events: {
+        sendUserMessage: vi.fn(async () => ({
+          messageId: "transcript-1",
+          runId: null,
+          seq: 1,
+          taskId: null,
+        })),
+      },
+      jobs: { enqueue: vi.fn() },
+      send: vi.fn(),
+      providerId: "slack",
+      botId: "bot-1",
+    });
+    (
+      bridge as unknown as {
+        target: { id: string; spaceId: string; userId: string; name: string };
+      }
+    ).target = { id: "bot-1", spaceId: "space-1", userId: "owner-1", name: "Chief" };
+
+    await bridge.receive(
+      {
+        eventId: "Ev-deferred",
+        workspaceId: "T-1",
+        kind: "mention",
+        conversationKey: "channel:C-1:100.1",
+        conversationId: "C-1",
+        senderId: "U-1",
+        senderName: "Ada",
+        content: "Run the release routine",
+      },
+      { queueAgent: false },
+    );
+
+    expect(upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ create: expect.objectContaining({ status: "deferred" }) }),
+    );
+    await expect(bridge.resolveDeferredMessage("Ev-deferred", "routine", "mention")).resolves.toBe(
+      true,
+    );
+    expect(updateMany).toHaveBeenLastCalledWith({
+      where: {
+        providerEventId: "Ev-deferred",
+        status: "deferred",
+        externalConversation: { provider: "slack", botId: "bot-1" },
+      },
+      data: { status: "ignored", engagementReason: "message_routine_wake" },
+    });
+
+    await bridge.resolveDeferredMessage("Ev-ambient", "agent", "ambient");
+    expect(updateMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({ data: { status: "observed" } }),
+    );
+  });
+
+  it("does not queue a stale received snapshot after another path deferred it", async () => {
+    const updateMany = vi.fn(async () => ({ count: 0 }));
+    const sendUserMessage = vi.fn();
+    const bridge = new TeamChatBridge({
+      prisma: { externalMessage: { updateMany } } as unknown as PrismaClient,
+      events: { sendUserMessage },
+      jobs: { enqueue: vi.fn() },
+      send: vi.fn(),
+      providerId: "slack",
+      botId: "bot-1",
+    });
+
+    await (
+      bridge as unknown as {
+        queue(message: {
+          id: string;
+          providerEventId: string;
+          senderId: string;
+          senderName: string;
+          content: string;
+          batchContext: null;
+          externalConversation: {
+            spaceId: string;
+            botId: string;
+            userId: string;
+            thread: { id: string };
+          };
+        }): Promise<void>;
+      }
+    ).queue({
+      id: "external-1",
+      providerEventId: "Ev-1",
+      senderId: "U-1",
+      senderName: "Ada",
+      content: "Run the release routine",
+      batchContext: null,
+      externalConversation: {
+        spaceId: "space-1",
+        botId: "bot-1",
+        userId: "owner-1",
+        thread: { id: "thread-1" },
+      },
+    });
+
+    expect(updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "external-1", status: "received" } }),
+    );
+    expect(sendUserMessage).not.toHaveBeenCalled();
+  });
+
   it("creates one isolated run and one reply for duplicate provider events", async () => {
     const records: Array<Record<string, unknown>> = [];
     const sendUserMessage = vi.fn(async (input: { createRun?: boolean }) =>
